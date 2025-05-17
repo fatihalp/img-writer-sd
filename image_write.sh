@@ -1,8 +1,81 @@
 #!/bin/bash
 
 LINUX_USE_OFLAG_DIRECT=true
-DD_BLOCK_SIZE="128M"
+# Dinamik blok boyutu hesaplamasını geçersiz kılmak için buraya bir değer girin (örn: "64M", "128M").
+# Dinamik hesaplama/varsayılan için boş bırakın veya "AUTO" olarak ayarlayın.
+# Önceki isteğiniz üzerine 128M ile sorun yaşandığı için "AUTO" bırakıp scriptin daha küçük bir değer bulmasını sağlayabilirsiniz.
+# Veya spesifik olarak "32M", "64M" gibi bir değer deneyebilirsiniz.
+USER_DD_BLOCK_SIZE_OVERRIDE="AUTO"
 PV_UPDATE_INTERVAL=5
+
+# --- Script Internal Variables ---
+FINAL_DD_BLOCK_SIZE="" # dd için kullanılacak nihai blok boyutu
+
+function determine_block_size() {
+    local disk_device_name="$1" # e.g., /dev/sdb
+    local determined_bs=""
+    local base_disk_name=$(basename "$disk_device_name")
+
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        # /sys/block/sdX/queue/optimal_io_size (bayt cinsinden) okumayı dene
+        local optimal_io_s
+        if optimal_io_s=$(cat "/sys/block/$base_disk_name/queue/optimal_io_size" 2>/dev/null) && [[ "$optimal_io_s" -gt 0 ]]; then
+            # Değeri dd için makul bir 'M' değerine dönüştür
+            if [[ "$optimal_io_s" -ge 67108864 ]]; then # >= 64MB
+                determined_bs="64M"
+            elif [[ "$optimal_io_s" -ge 33554432 ]]; then # >= 32MB
+                determined_bs="32M"
+            elif [[ "$optimal_io_s" -ge 16777216 ]]; then # >= 16MB
+                determined_bs="16M"
+            elif [[ "$optimal_io_s" -ge 4194304 ]]; then  # >= 4MB
+                determined_bs="4M"
+            elif [[ "$optimal_io_s" -ge 1048576 ]]; then  # >= 1MB
+                determined_bs="1M"
+            else # optimal_io_s < 1MB ise, (örneğin 512KB ise 8x = 4MB olacak şekilde)
+                 # Daha karmaşık bir mantık yerine, küçük optimal_io için güvenli bir varsayılan kullan.
+                if [[ "$optimal_io_s" -ge 524288 ]]; then # 512KB ise
+                    determined_bs="4M"
+                else # Daha da küçükse veya belirlenemiyorsa
+                    determined_bs="4M" # Güvenli bir alt sınır
+                fi
+            fi
+            if [[ -n "$determined_bs" ]]; then
+                 echo "Info: Suggested block size based on optimal_io_size ($optimal_io_s bytes): $determined_bs"
+            fi
+        fi
+
+        # optimal_io_size bulunamadıysa veya çok küçükse, physical_block_size'a bak
+        if [[ -z "$determined_bs" ]]; then
+            local physical_bs
+            if physical_bs=$(cat "/sys/block/$base_disk_name/queue/physical_block_size" 2>/dev/null) && [[ "$physical_bs" -ge 512 ]]; then
+                if [[ "$physical_bs" -ge 4096 ]]; then # 4K veya üzeri sektörler için
+                    determined_bs="4M" # 4M genellikle iyi bir başlangıçtır
+                else # 512 byte sektörler için
+                    determined_bs="1M" # Daha küçük bir varsayılan
+                fi
+                echo "Info: Suggested block size based on physical_block_size ($physical_bs bytes): $determined_bs"
+            fi
+        fi
+    fi
+
+    if [[ -n "$USER_DD_BLOCK_SIZE_OVERRIDE" && "$USER_DD_BLOCK_SIZE_OVERRIDE" != "AUTO" ]]; then
+        FINAL_DD_BLOCK_SIZE="$USER_DD_BLOCK_SIZE_OVERRIDE"
+        echo "Info: Using user-defined block size: $FINAL_DD_BLOCK_SIZE"
+    elif [[ -n "$determined_bs" ]]; then
+        FINAL_DD_BLOCK_SIZE="$determined_bs"
+        echo "Info: Using dynamically suggested block size for '$disk_device_name': $FINAL_DD_BLOCK_SIZE"
+    else
+        # Nihai varsayılan (eğer sysfs bilgisi yoksa/işe yaramazsa ve kullanıcı override etmediyse)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            FINAL_DD_BLOCK_SIZE="4M" # macOS için genellikle rdisk kullanımı bs'den daha etkilidir
+        else
+            # Önceki 128M sorunları göz önüne alındığında daha güvenli bir varsayılan
+            FINAL_DD_BLOCK_SIZE="16M"
+        fi
+        echo "Info: Using default block size for '$disk_device_name': $FINAL_DD_BLOCK_SIZE"
+    fi
+}
+
 
 function find_disk() {
     echo "--------------------------------------------------------------------"
@@ -41,6 +114,9 @@ if [[ "$OSTYPE" == "darwin"* ]] && [[ "$disk_name" =~ ^/dev/disk([0-9]+)$ ]]; th
     fi
 fi
 
+# Blok boyutunu belirle (kullanıcı override'ı veya dinamik/varsayılan)
+determine_block_size "$disk_name"
+
 if [[ ! -f "$img_path" ]]; then
     echo "Default image '$img_path_default' not found."
     read -p "Enter full path to your image file: " custom_img_path
@@ -52,7 +128,7 @@ if [[ ! -f "$img_path" ]]; then
 fi
 
 echo "Using image file: $img_path"
-echo "dd block size: $DD_BLOCK_SIZE"
+echo "Effective dd block size: $FINAL_DD_BLOCK_SIZE" # Değişti: FINAL_DD_BLOCK_SIZE
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     echo "Linux oflag=direct setting: $LINUX_USE_OFLAG_DIRECT"
 fi
@@ -153,10 +229,10 @@ fi
 
 echo ""
 echo "Writing '$img_path' to '$disk_name'..."
-echo "This may take a while. Block size: $DD_BLOCK_SIZE"
+echo "This may take a while. Effective block size: $FINAL_DD_BLOCK_SIZE" # Değişti
 echo ""
 
-DD_CMD_BASE="dd of='$disk_name' bs='$DD_BLOCK_SIZE'"
+DD_CMD_BASE="dd of='$disk_name' bs='$FINAL_DD_BLOCK_SIZE'" # Değişti
 DD_OFLAGS=""
 DD_STATUS_PROGRESS=""
 
